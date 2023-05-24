@@ -3,18 +3,16 @@
 #include <SoftwareSerial.h>
 #include <EEPROM.h>
 
-#define ARDUINO_MEMORY 512
+#define ARDUINO_MEMORY 1024
 
 extern uint8_t key[];
 SoftwareSerial HC12(2, 3);
-int seq = 0;
+int sequence = 0;
 long seed;
-bool test = true;
 
 void setup() {
   Serial.begin(9600);
   HC12.begin(9600);
-  // clearMemory();
 }
 
 void loop() {
@@ -31,25 +29,20 @@ void loop() {
 
     if (!checkSeed(splittedCode[1])) {
       randomSeed(splittedCode[1]);
-
       int i = 0;
 
-      for (long n = 0; n != splittedCode[0]; i++) {
+      for (long n = 0; n != splittedCode[0]; i++)
         n = random(10000, 99999);
-        // Serial.print(n);
-        // Serial.print("-");
-      }
-      // Serial.println(i);
 
-      if (i > seq) {
-        seq = i;
+      if (i > sequence) {
+        sequence = i;
         switchGate();
       } else {
         Serial.println("Código fora da sequência.");
         Serial.println();
       }
     } else {
-      seq = 0;
+      sequence = 0;
       String message = paddingString("resetSeed");
 
       if (message != "") {
@@ -97,8 +90,8 @@ void clearMemory() {
 int searchEmptyIndexInMemory() {
   int index = 2;
 
-  while (index < ARDUINO_MEMORY) {
-    if (readMemory(index) == 0)
+  while (index < ARDUINO_MEMORY - 2) {
+    if (readMemory(index) == 1)
       break;
 
     index += 2;
@@ -123,14 +116,33 @@ void splitCode(String decrypted_code, long *splittedCode) {
   splittedCode[1] = atol(code_char);
 }
 
-bool checkLastSeed(long seed) {
-  int lastIndex = searchEmptyIndexInMemory() - 2;
+// Store seed in EEPROM memory in cycles preceded by value 1
+void storeSeed(long seed) {
+  int lastIndex = searchEmptyIndexInMemory();
 
-  if(lastIndex - 2 > 0 && readMemory(lastIndex) == seed){
+  writeMemory(lastIndex, seed);
+
+  if (lastIndex == ARDUINO_MEMORY - 2)
+    lastIndex = 2;
+  else
+    lastIndex += 2;
+
+  writeMemory(lastIndex, 1);
+}
+
+// Check if the current seed is the last one registered in the EEPROM memory
+bool checkLastSeed(long seed) {
+  int lastIndex = searchEmptyIndexInMemory();
+
+  if (lastIndex == 2)
+    lastIndex = ARDUINO_MEMORY - 2;
+  else
+    lastIndex -= 2;
+
+  if (readMemory(lastIndex) == seed) {
     Serial.println("Última seed.");
     return true;
-  }
-  else {
+  } else {
     Serial.println("Seed repetida.");
     return false;
   }
@@ -139,33 +151,24 @@ bool checkLastSeed(long seed) {
 // Check if the seed has already been used in the EEPROM memory
 bool checkSeed(long seed) {
   for (int i = 2; i < ARDUINO_MEMORY; i += 2) {
-    if(i == ARDUINO_MEMORY - 2){
-      clearMemory();
-      Serial.println("Memória EEPROM limpa com sucesso.");
-    }
-
     if (readMemory(i) == 0)
       break;
 
-    // Serial.print(readMemory(i));
-    // Serial.print("-");
-
-    if (seed == readMemory(i)){
-      if(checkLastSeed(seed))
+    if (seed == readMemory(i)) {
+      if (checkLastSeed(seed))
         return false;
       else
         return true;
     }
   }
-  // Serial.println();
-  seq = 0;
-  writeMemory(searchEmptyIndexInMemory(), seed);
-  
+  sequence = 0;
+  storeSeed(seed);
+
   return false;
 }
 
 // Returns the state of the gate (0) for closed and (1) for open
-void getGate() {
+int getGate() {
   return readMemory(0);
 }
 

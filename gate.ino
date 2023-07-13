@@ -4,43 +4,59 @@
 #include <RTClib.h>
 
 #include <ESP8266WiFi.h>
-#include <ESP8266WebServer.h>
 #include <ESP8266HTTPClient.h>
+#include <WiFiClientSecure.h>
 
 #include <ArduinoJson.h>
 
 #include <Servo.h>
 
-#define EEPROM_SIZE 1024
+#define EEPROM_SIZE 128
 #define CODE_LENGTH 32
 #define CODE_EXPIRE 10
+
 #define SERVO_PORT 16
 #define SERVO_DEGREES 180
 #define LED_PORT 14
 
-ESP8266WebServer web_server(80);
+#define REQUEST_INTERVAL 2000
+
 SoftwareSerial HC12(12, 13);
 RTC_DS1307 RTC;
 AES AES;
 
 Servo servo;
 
-extern String SSID;
-extern String PASS;
-extern String server_name;
-extern String gate_id;
-
+// Code settings
 extern String key;
 extern String iv;
-unsigned long seed, random_number;
+
+// Wi-fi settings
+extern const char *SSID;
+extern const char *PASS;
+
+// Application settings
+extern const char *server_name;
+extern const char *token;
+extern const char *gate_id;
+
+unsigned long random_number, previous_time = 0;
 
 void setup() {
   HC12.begin(9600);
   Serial.begin(115200);
+  WiFi.mode(WIFI_STA);
   WiFi.begin(SSID, PASS);
   EEPROM.begin(EEPROM_SIZE);
+
   pinMode(LED_PORT, OUTPUT);
   servo.attach(SERVO_PORT);
+
+  if (!RTC.begin()) {
+    Serial.println("DS1307 não encontrado");
+    // RTC.adjust(DateTime(F(__DATE__), F(__TIME__)));
+    while (true) {}
+  }
 
   if (getGate()) {
     servo.write(SERVO_DEGREES);
@@ -48,12 +64,6 @@ void setup() {
   } else {
     servo.write(0);
     digitalWrite(LED_PORT, LOW);
-  }
-
-  if (!RTC.begin()) {
-    Serial.println("DS1307 não encontrado");
-    // RTC.adjust(DateTime(F(__DATE__), F(__TIME__)));
-    while (true) {}
   }
 
   while (WiFi.status() != WL_CONNECTED) {
@@ -64,22 +74,59 @@ void setup() {
   Serial.println();
   Serial.print("Conectado | Endereço IP: ");
   Serial.println(WiFi.localIP());
-
-  web_server.on("/update-gate", responseFromAPI);
-  web_server.begin();
-  Serial.println("Servidor iniciado");
 }
 
 void loop() {
+  unsigned long current_time = millis();
 
-  web_server.handleClient();
+  if (current_time - previous_time > REQUEST_INTERVAL) {
+    char path[200] = "", response[200] = "";
+    strcpy(path, "/gates/");
+    strcat(path, gate_id);
 
-  char c = Serial.read();
+    requestGET(path, (char *)response);
 
-  if (c == 'a') {
-    switchGate("Teste bem sucedido");
-  } else if (c == 'h')
-    printHour();
+    if (response[0] != '\0') {
+      DynamicJsonDocument gate(32);
+      deserializeJson(gate, response);
+
+      int open = gate["provisional_open"];
+      Serial.println(open);
+
+      if (open != getGate()) {
+        switchGate(open);
+
+        char path[200] = "";
+        strcpy(path, "/gates/");
+        strcat(path, gate_id);
+        strcat(path, "/solicitations/valid");
+
+        DynamicJsonDocument status(1024);
+        status["status"] = open;
+
+        String request;
+        serializeJson(status, request);
+
+        requestPATCH(path, (char *)request.c_str());
+      }
+    }
+
+    previous_time = current_time;
+  }
+
+  if (Serial.availableForWrite()) {
+    String c = Serial.readStringUntil('\n');
+
+    if (c[0] == 'a') {
+      switchGate("Teste bem sucedido");
+    } else if (c[0] == 't') {
+      c = strtok((char *)c.c_str(), " ");
+      c = strtok(NULL, " ");
+
+      RTC.adjust(DateTime(__DATE__, c.c_str()));
+    } else if (c[0] == 'h')
+      printHour();
+  }
 
   if (HC12.available()) {
     DateTime now = RTC.now();
@@ -110,14 +157,28 @@ void loop() {
             Serial.println("s");
             switchGate(encrypted_code);
           } else {
-            requestToAPI(400, "Código expirado", encrypted_code);
             Serial.println("Código expirado");
             Serial.println();
+            String solicitation = newSolicitation(6, encrypted_code);
+
+            char path[200] = "", response[200] = "";
+            strcpy(path, "/solicitations/");
+            strcat(path, gate_id);
+            strcat(path, "/gate");
+
+            requestPOST(path, (char *)solicitation.c_str(), (char *)response);
           }
         } else {
-          requestToAPI(400, "Código fora da sequência", encrypted_code);
           Serial.print("Código fora da sequência");
           Serial.println();
+          String solicitation = newSolicitation(5, encrypted_code);
+
+          char path[200] = "", response[200] = "";
+          strcpy(path, "/solicitations/");
+          strcat(path, gate_id);
+          strcat(path, "/gate");
+
+          requestPOST(path, (char *)solicitation.c_str(), (char *)response);
         }
       } else {
         setSequence(0);
@@ -133,55 +194,18 @@ void loop() {
         }
       }
     } else {
-      requestToAPI(404, "Código inválido", encrypted_code);
       Serial.println("Código inválido");
       Serial.println();
+      String solicitation = newSolicitation(4, encrypted_code);
+
+      char path[200] = "", response[200] = "";
+      strcpy(path, "/solicitations/");
+      strcat(path, gate_id);
+      strcat(path, "/gate");
+
+      requestPOST(path, (char *)solicitation.c_str(), (char *)response);
     }
   }
-}
-
-// Read memory from EEPROM each 2 addresses
-long readMemory(int address) {
-  byte hb = EEPROM.read(address);
-  byte lb = EEPROM.read(address + 1);
-
-  word bytes;
-  bytes = word(hb, lb);
-
-  return bytes;
-}
-
-// Write in memory from EEPROM in 2 addresses
-void writeMemory(int address, unsigned long seed) {
-  byte hb = highByte(seed);
-  byte lb = lowByte(seed);
-
-  word bytes;
-  bytes = word(hb, lb);
-
-  EEPROM.put(address, hb);
-  EEPROM.put(address + 1, lb);
-  EEPROM.commit();
-}
-
-// Clear EEPROM memory by assigning 0 to all bytes
-void clearMemory() {
-  for (int i = 4; i < EEPROM_SIZE; i += 2)
-    writeMemory(i, 0);
-}
-
-// Searches the first empty position and returns in integer format
-int searchEmptyIndexInMemory() {
-  int index = 4;
-
-  while (index < EEPROM_SIZE - 2) {
-    if (readMemory(index) == 1)
-      break;
-
-    index += 2;
-  }
-
-  return index;
 }
 
 // Splits the code into sequence(index 0 of splitted_code), seed(index 1 of splitted_code) and unixtime(index 2 of splitted_code)
@@ -228,10 +252,9 @@ bool checkLastSeed(unsigned long seed) {
   else
     lastIndex -= 2;
 
-  if (readMemory(lastIndex) == seed) {
-    Serial.println("Última seed.");
+  if (readMemory(lastIndex) == seed)
     return true;
-  } else {
+  else {
     Serial.println("Seed repetida.");
     return false;
   }
@@ -272,113 +295,63 @@ void setSequence(int sequence) {
 
 // Changes the state of the gate at each call
 void switchGate(String encrypted_code) {
-  if (readMemory(0)) {
+  if (getGate()) {
     writeMemory(0, 0);
     digitalWrite(LED_PORT, LOW);
     Serial.println("Código correto, fechando portão!");
     Serial.println();
 
-    for (int i = SERVO_DEGREES; i >= 0; i--)
+    for (int i = SERVO_DEGREES; i >= 0; i -= 3)
       servo.write(i);
 
-    requestToAPI(200, "Fechando portão", encrypted_code);
+    String solicitation = newSolicitation(2, encrypted_code);
+
+    char path[200] = "", response[200] = "";
+    strcpy(path, "/solicitations/");
+    strcat(path, gate_id);
+    strcat(path, "/gate");
+
+    requestPOST(path, (char *)solicitation.c_str(), (char *)response);
   } else {
     writeMemory(0, 1);
     Serial.println("Código correto, abrindo portão!");
     Serial.println();
 
-    for (int i = 0; i <= SERVO_DEGREES; i++)
+    for (int i = 0; i <= SERVO_DEGREES; i += 3)
       servo.write(i);
 
     digitalWrite(LED_PORT, HIGH);
-    requestToAPI(200, "Abrindo portão", encrypted_code);
+
+    String solicitation = newSolicitation(1, encrypted_code);
+
+    char path[200] = "", response[200] = "";
+    strcpy(path, "/solicitations/");
+    strcat(path, gate_id);
+    strcat(path, "/gate");
+
+    requestPOST(path, (char *)solicitation.c_str(), (char *)response);
   }
 }
 
 // Changes the state of the gate according to the status parameter
 void switchGate(int status) {
-  if (status != getGate()) {
-    if (status) {
-      writeMemory(0, 1);
-      Serial.println("Abrindo portão!");
-      Serial.println();
-      for (int i = 0; i <= SERVO_DEGREES; i++)
-        servo.write(i);
-        
-      digitalWrite(LED_PORT, HIGH);
-    } else {
-      writeMemory(0, 0);
-      digitalWrite(LED_PORT, LOW);
-      Serial.println("Fechando portão!");
-      Serial.println();
+  if (status) {
+    writeMemory(0, 1);
+    Serial.println("Abrindo portão!");
+    Serial.println();
+    for (int i = 0; i <= SERVO_DEGREES; i += 3)
+      servo.write(i);
 
-      for (int i = SERVO_DEGREES; i >= 0; i--)
-        servo.write(i);
-    }
+    digitalWrite(LED_PORT, HIGH);
+  } else {
+    writeMemory(0, 0);
+    digitalWrite(LED_PORT, LOW);
+    Serial.println("Fechando portão!");
+    Serial.println();
+
+    for (int i = SERVO_DEGREES; i >= 0; i -= 3)
+      servo.write(i);
   }
-}
-
-// Pads with spaces until the string is mod 16 characters long
-String paddingString(String text) {
-  const char *text_char = text.c_str();
-
-  if (strlen(text_char) <= CODE_LENGTH) {
-    for (int i = strlen(text_char); i < CODE_LENGTH; i++)
-      text.concat(" ");
-
-    return text;
-  } else
-    return "";
-}
-
-// Encrypts a string with AES and base64
-String encryptCode(String code, String iv) {
-  char code_char[CODE_LENGTH];
-
-  for (int i = 0; i < CODE_LENGTH; i++)
-    code_char[i] = code.c_str()[i];
-
-  AES.set_key((byte *)key.c_str(), 16);
-  AES.cbc_encrypt((byte *)code_char, (byte *)code_char, CODE_LENGTH / 16, (byte *)iv.c_str());
-
-  char encrypted_code[1000];
-  base64_encode(encrypted_code, (char *)code_char, CODE_LENGTH);
-
-  return encrypted_code;
-}
-
-// Decrypts a string with base64 and AES
-String decryptCode(String code, String iv) {
-  char decrypted_code[code.length()];
-  base64_decode((char *)decrypted_code, (char *)code.c_str(), code.length());
-
-  AES.set_key((byte *)key.c_str(), 16);
-  AES.cbc_decrypt((byte *)decrypted_code, (byte *)decrypted_code, CODE_LENGTH / 16, (byte *)iv.c_str());
-
-  return decrypted_code;
-}
-
-// Refactoring of the randomization algorithm based on Linear congruential generator
-long randomRefactored(long howbig) {
-  if (howbig == 0)
-    return 0;
-
-  random_number = random_number * 1103515245 + 12345;
-  return (unsigned int)(random_number / 65536) % howbig;
-}
-
-// Refactoring of the randomization algorithm based on Linear congruential generator
-long randomRefactored(long howsmall, long howbig) {
-  if (howsmall >= howbig)
-    return howsmall;
-
-  long diff = howbig - howsmall;
-  return randomRefactored(diff) + howsmall;
-}
-
-// Refactoring of the randomization algorithm based on Linear congruential generator
-void randomSeedRefactored(long value) {
-  random_number = value;
 }
 
 // Print date and hour in serial monitor
@@ -398,68 +371,4 @@ void printHour() {
   Serial.print(':');
   Serial.print(now.second(), DEC);
   Serial.println();
-}
-
-// Send a request to the API
-void requestToAPI(int status_code, String message, String encrypted_code) {
-  String path = "/solicitation/";
-  path += gate_id;
-  path += "/gate";
-
-  if ((WiFi.status() == WL_CONNECTED)) {
-    WiFiClient client;
-    HTTPClient http;
-
-    if (http.begin(client, server_name + path)) {
-      http.setTimeout(5000);
-      http.addHeader("Content-Type", "application/json");
-
-      DynamicJsonDocument gate(1024);
-      gate["status"] = getGate();
-      gate["method"] = "ARDUINO";
-      gate["status_code"] = status_code;
-      gate["message"] = message;
-      gate["code"] = encrypted_code;
-
-      String request;
-      serializeJson(gate, request);
-
-      int httpResponseCode = http.POST(request);
-
-      if (httpResponseCode > 0) {
-        Serial.print("[HTTP] Code ");
-        Serial.print(httpResponseCode);
-        Serial.println();
-
-        String payload = http.getString();
-        Serial.println(payload);
-        Serial.println();
-      } else
-        Serial.printf("[HTTP] Erro: %s\n", http.errorToString(httpResponseCode).c_str());
-
-      http.end();
-    } else
-      Serial.printf("[HTTP] Não foi possível conectar");
-  }
-}
-
-// Receive a response from the API
-void responseFromAPI() {
-
-  if (!web_server.hasArg("plain")) {
-    web_server.send(200, "text/plain", "Body not received");
-    return;
-  }
-
-  String payload = web_server.arg("plain");
-
-  web_server.send(200, "text/plain", payload);
-
-  DynamicJsonDocument payload_json(1024);
-  deserializeJson(payload_json, payload);
-  int status = payload_json["status"];
-  String method = payload_json["method"];
-
-  if (method)
-    switchGate(status);
 }
